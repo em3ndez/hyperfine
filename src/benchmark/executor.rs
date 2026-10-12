@@ -1,0 +1,401 @@
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::process::ExitStatus;
+
+use crate::benchmark::measurement::Measurement;
+use crate::benchmark::measurement::Measurements;
+use crate::command::Command;
+use crate::options::{CmdFailureAction, CommandOutputPolicy, Options, OutputStyleOption, Shell};
+use crate::output::progress_bar::get_progress_bar;
+use crate::quantity::{second, Information, Time, Zero};
+use crate::timer::execute_and_measure;
+use crate::util::randomized_environment_offset;
+
+use anyhow::{bail, Context, Result};
+
+#[derive(Clone, Copy)]
+pub enum BenchmarkIteration {
+    NonBenchmarkRun,
+    Warmup(u64),
+    Benchmark(u64),
+}
+
+impl BenchmarkIteration {
+    pub fn to_env_var_value(&self) -> Option<String> {
+        match self {
+            BenchmarkIteration::NonBenchmarkRun => None,
+            BenchmarkIteration::Warmup(i) => Some(format!("warmup-{}", i)),
+            BenchmarkIteration::Benchmark(i) => Some(format!("{}", i)),
+        }
+    }
+}
+
+pub trait Executor {
+    /// Run the given command and measure the execution time
+    fn run_command_and_measure(
+        &self,
+        command: &Command<'_>,
+        iteration: BenchmarkIteration,
+        command_failure_action: Option<CmdFailureAction>,
+        output_policy: &CommandOutputPolicy,
+    ) -> Result<Measurement>;
+
+    /// Run a lifecycle command through a shell, always treating failures as errors.
+    fn run_intermediate_command_and_measure(
+        &self,
+        command: &Command<'_>,
+        iteration: BenchmarkIteration,
+        output_policy: &CommandOutputPolicy,
+    ) -> Result<Measurement> {
+        self.run_command_and_measure(
+            command,
+            iteration,
+            Some(CmdFailureAction::RaiseError),
+            output_policy,
+        )
+    }
+
+    /// Perform a calibration of this executor. For example,
+    /// when running commands through a shell, we need to
+    /// measure the shell spawning time separately in order
+    /// to subtract it from the full runtime later.
+    fn calibrate(&mut self) -> Result<()>;
+
+    /// Return the time overhead for this executor when
+    /// performing a measurement. This should return the time
+    /// that is being used in addition to the actual runtime
+    /// of the command.
+    fn time_overhead(&self) -> Time;
+}
+
+fn run_command_and_measure_common(
+    mut command: std::process::Command,
+    iteration: BenchmarkIteration,
+    command_failure_action: Option<CmdFailureAction>,
+    options: &Options,
+    command_output_policy: &CommandOutputPolicy,
+    command_name: &str,
+    collect_hardware_counters: bool,
+) -> Result<Measurement> {
+    let stdin = options.command_input_policy.get_stdin()?;
+    let (stdout, stderr) = command_output_policy.get_stdout_stderr()?;
+    command.stdin(stdin).stdout(stdout).stderr(stderr);
+
+    command.env(
+        "HYPERFINE_RANDOMIZED_ENVIRONMENT_OFFSET",
+        randomized_environment_offset::value(),
+    );
+
+    if let Some(value) = iteration.to_env_var_value() {
+        command.env("HYPERFINE_ITERATION", value);
+    }
+
+    let measurement = execute_and_measure(command, collect_hardware_counters)
+        .with_context(|| format!("Failed to run command '{command_name}'"))?;
+
+    if !measurement.exit_status.success() {
+        use crate::util::exit_code::extract_exit_code;
+
+        let show_ignore_failure_hint = command_failure_action.is_none();
+        let should_fail = match command_failure_action
+            .as_ref()
+            .unwrap_or(&options.command_failure_action)
+        {
+            CmdFailureAction::RaiseError => true,
+            CmdFailureAction::IgnoreAllFailures => false,
+            CmdFailureAction::IgnoreSpecificFailures(codes) => {
+                // Only fail if the exit code is not in the list of codes to ignore
+                if let Some(exit_code) = extract_exit_code(measurement.exit_status) {
+                    !codes.contains(&exit_code)
+                } else {
+                    // If we can't extract an exit code, treat it as a failure
+                    true
+                }
+            }
+        };
+
+        if should_fail {
+            let when = match iteration {
+                BenchmarkIteration::NonBenchmarkRun => "a non-benchmark run".to_string(),
+                BenchmarkIteration::Warmup(0) => "the first warmup run".to_string(),
+                BenchmarkIteration::Warmup(i) => format!("warmup iteration {i}"),
+                BenchmarkIteration::Benchmark(0) => "the first benchmark run".to_string(),
+                BenchmarkIteration::Benchmark(i) => format!("benchmark iteration {i}"),
+            };
+            let cause = measurement.exit_status.code().map_or_else(
+                || "was terminated by a signal".to_owned(),
+                |code| format!("terminated with non-zero exit code {code}"),
+            );
+            let hint = if show_ignore_failure_hint {
+                " Use the '-i'/'--ignore-failure' option if you want to ignore this. \
+                 Alternatively, use the '--show-output' option to debug what went wrong."
+            } else {
+                " Use the '--show-output' option to debug what went wrong."
+            };
+            bail!("Command '{command_name}' {cause} in {when}.{hint}");
+        }
+    }
+
+    Ok(measurement)
+}
+
+pub struct RawExecutor<'a> {
+    options: &'a Options,
+}
+
+impl<'a> RawExecutor<'a> {
+    pub fn new(options: &'a Options) -> Self {
+        RawExecutor { options }
+    }
+}
+
+impl Executor for RawExecutor<'_> {
+    fn run_command_and_measure(
+        &self,
+        command: &Command<'_>,
+        iteration: BenchmarkIteration,
+        command_failure_action: Option<CmdFailureAction>,
+        output_policy: &CommandOutputPolicy,
+    ) -> Result<Measurement> {
+        run_command_and_measure_common(
+            command.get_command()?,
+            iteration,
+            command_failure_action,
+            self.options,
+            output_policy,
+            &command.get_command_line(),
+            matches!(iteration, BenchmarkIteration::Benchmark(_)),
+        )
+    }
+
+    fn run_intermediate_command_and_measure(
+        &self,
+        command: &Command<'_>,
+        iteration: BenchmarkIteration,
+        output_policy: &CommandOutputPolicy,
+    ) -> Result<Measurement> {
+        // Keep shell startup in the hook's duration: raw benchmarks have no
+        // calibrated shell overhead to add back when estimating the run count.
+        ShellExecutor::new(&Shell::platform_default(), self.options)
+            .run_intermediate_command_and_measure(command, iteration, output_policy)
+    }
+
+    fn calibrate(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn time_overhead(&self) -> Time {
+        Time::zero()
+    }
+}
+
+pub struct ShellExecutor<'a> {
+    options: &'a Options,
+    shell: &'a Shell,
+    shell_spawning_time: Option<Measurement>,
+}
+
+impl<'a> ShellExecutor<'a> {
+    pub fn new(shell: &'a Shell, options: &'a Options) -> Self {
+        ShellExecutor {
+            shell,
+            options,
+            shell_spawning_time: None,
+        }
+    }
+}
+
+impl Executor for ShellExecutor<'_> {
+    fn run_command_and_measure(
+        &self,
+        command: &Command<'_>,
+        iteration: BenchmarkIteration,
+        command_failure_action: Option<CmdFailureAction>,
+        output_policy: &CommandOutputPolicy,
+    ) -> Result<Measurement> {
+        let on_windows_cmd = cfg!(windows) && *self.shell == Shell::Default("cmd.exe");
+        let mut command_builder = self.shell.command();
+        command_builder.envs(command.get_environment());
+        command_builder.arg(if on_windows_cmd { "/C" } else { "-c" });
+
+        // Windows needs special treatment for its behavior on parsing cmd arguments
+        if on_windows_cmd {
+            #[cfg(windows)]
+            command_builder.raw_arg(command.get_command_line());
+        } else {
+            command_builder.arg(command.get_command_line());
+        }
+
+        let mut measurement = run_command_and_measure_common(
+            command_builder,
+            iteration,
+            command_failure_action,
+            self.options,
+            output_policy,
+            &command.get_command_line(),
+            false,
+        )?;
+
+        // Subtract shell spawning time
+        fn ensure_non_negative(time: Time) -> Time {
+            if time < Time::zero() {
+                Time::zero()
+            } else {
+                time
+            }
+        }
+
+        if let Some(ref spawning_time) = self.shell_spawning_time {
+            measurement.time_wall_clock =
+                ensure_non_negative(measurement.time_wall_clock - spawning_time.time_wall_clock);
+            measurement.time_user =
+                ensure_non_negative(measurement.time_user - spawning_time.time_user);
+            measurement.time_system =
+                ensure_non_negative(measurement.time_system - spawning_time.time_system);
+            measurement.time_cpu = measurement.time_user + measurement.time_system;
+        }
+
+        Ok(measurement)
+    }
+
+    /// Measure the average shell spawning time
+    fn calibrate(&mut self) -> Result<()> {
+        const COUNT: u64 = 50;
+        let progress_bar = if self.options.output_style != OutputStyleOption::Disabled {
+            Some(get_progress_bar(
+                COUNT,
+                "Measuring shell spawning time",
+                self.options.output_style,
+            ))
+        } else {
+            None
+        };
+
+        let mut measurements = Measurements::default();
+
+        for _ in 0..COUNT {
+            // Just run the shell without any command
+            let measurement = self.run_command_and_measure(
+                &Command::new(None, ""),
+                BenchmarkIteration::NonBenchmarkRun,
+                None,
+                &CommandOutputPolicy::Null,
+            );
+
+            match measurement {
+                Err(_) => {
+                    let shell_cmd = if cfg!(windows) {
+                        format!("{} /C \"\"", self.shell)
+                    } else {
+                        format!("{} -c \"\"", self.shell)
+                    };
+
+                    bail!(
+                        "Could not measure shell execution time. Make sure you can run '{}'.",
+                        shell_cmd
+                    );
+                }
+                Ok(result) => {
+                    measurements.push(result);
+                }
+            }
+
+            if let Some(bar) = progress_bar.as_ref() {
+                bar.inc(1)
+            }
+        }
+
+        if let Some(bar) = progress_bar.as_ref() {
+            bar.finish_and_clear()
+        }
+
+        self.shell_spawning_time = Some(Measurement {
+            time_wall_clock: measurements.time_wall_clock_mean(),
+            time_cpu: measurements.time_user_mean() + measurements.time_system_mean(),
+            time_user: measurements.time_user_mean(),
+            time_system: measurements.time_system_mean(),
+            memory_peak_resident: None,
+            hardware_counters: Default::default(),
+            exit_status: ExitStatus::default(),
+        });
+
+        Ok(())
+    }
+
+    fn time_overhead(&self) -> Time {
+        self.shell_spawning_time.as_ref().unwrap().time_wall_clock
+    }
+}
+
+#[derive(Clone)]
+pub struct MockExecutor {
+    shell: Option<String>,
+}
+
+impl MockExecutor {
+    pub fn new(shell: Option<String>) -> Self {
+        MockExecutor { shell }
+    }
+
+    fn extract_time<S: AsRef<str>>(sleep_command: S) -> Time {
+        assert!(sleep_command.as_ref().starts_with("sleep "));
+        Time::new::<second>(
+            sleep_command
+                .as_ref()
+                .trim_start_matches("sleep ")
+                .parse::<f64>()
+                .unwrap(),
+        )
+    }
+}
+
+impl Executor for MockExecutor {
+    fn run_command_and_measure(
+        &self,
+        command: &Command<'_>,
+        _iteration: BenchmarkIteration,
+        _command_failure_action: Option<CmdFailureAction>,
+        _output_policy: &CommandOutputPolicy,
+    ) -> Result<Measurement> {
+        #[cfg(unix)]
+        let exit_status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(0)
+        };
+
+        #[cfg(windows)]
+        let exit_status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(0)
+        };
+
+        Ok(Measurement {
+            time_wall_clock: Self::extract_time(command.get_command_line()),
+            time_cpu: Time::zero(),
+            time_user: Time::zero(),
+            time_system: Time::zero(),
+            memory_peak_resident: Some(Information::zero()),
+            hardware_counters: Default::default(),
+            exit_status,
+        })
+    }
+
+    fn calibrate(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn time_overhead(&self) -> Time {
+        match &self.shell {
+            None => Time::zero(),
+            Some(shell) => Self::extract_time(shell),
+        }
+    }
+}
+
+#[test]
+fn test_mock_executor_extract_time() {
+    assert_eq!(
+        MockExecutor::extract_time("sleep 0.1"),
+        Time::new::<second>(0.1)
+    );
+}

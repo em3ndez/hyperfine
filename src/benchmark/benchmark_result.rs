@@ -1,0 +1,51 @@
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+
+use crate::benchmark::measurement::Measurements;
+
+/// Parameter value
+#[derive(Debug, Default, Clone, Serialize, PartialEq)]
+pub struct Parameter {
+    pub value: String,
+}
+
+/// Meta data and performance metrics for a single benchmark
+#[derive(Debug, Default, Clone, Serialize, PartialEq)]
+pub struct BenchmarkResult {
+    /// The command line being benchmarked, after parameter substitution.
+    /// For example, `sleep {duration}` with `duration=1` becomes `sleep 1`,
+    /// regardless of any custom name.
+    pub command: String,
+
+    /// The custom or automatically generated name after parameter substitution,
+    /// if it differs from `command`. Automatic names include environment overrides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// The name, followed by parameters not used in the command or environment
+    /// templates, in command-line order. For example, `sleep {duration}`
+    /// with `duration=1`, `branch=main`, and the custom name `wait {duration}s`
+    /// produces `wait 1s (branch = main)`. Without the custom name, this is
+    /// `sleep 1 (branch = main)`. Used in summaries and table exports.
+    #[serde(skip_serializing)]
+    pub display_name: String,
+
+    /// Performance metric measurements and exit codes for each run
+    #[serde(flatten)]
+    pub measurements: Measurements,
+
+    /// Parameter values for this benchmark
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, Parameter>,
+
+    /// Explicit environment overrides after parameter substitution.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+}
+
+impl BenchmarkResult {
+    pub fn get_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.command)
+    }
+}

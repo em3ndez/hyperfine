@@ -1,82 +1,131 @@
 #![cfg(windows)]
+#![warn(unsafe_op_in_unsafe_fn)]
 
-use std::mem;
-use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::process::Child;
+use std::process::{self, Child, ExitStatus};
+use std::{mem, os::windows::io::AsRawHandle, ptr};
 
-use winapi::um::processthreadsapi::GetProcessTimes;
-use winapi::um::winnt::HANDLE;
+use anyhow::Result;
 
-use crate::timer::{CPUTimes, TimerStart, TimerStop};
-use crate::units::Second;
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+        QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    },
+};
 
-const HUNDRED_NS_PER_MS: i64 = 10;
+#[cfg(feature = "windows_process_extensions_main_thread_handle")]
+use std::os::windows::process::ChildExt;
+#[cfg(feature = "windows_process_extensions_main_thread_handle")]
+use windows_sys::Win32::System::Threading::ResumeThread;
 
-pub fn get_cpu_timer(process: &Child) -> Box<dyn TimerStop<Result = (Second, Second)>> {
-    Box::new(CPUTimer::start_for_process(process))
+#[cfg(not(feature = "windows_process_extensions_main_thread_handle"))]
+use once_cell::sync::Lazy;
+#[cfg(not(feature = "windows_process_extensions_main_thread_handle"))]
+use windows_sys::{
+    s, w,
+    Win32::{
+        Foundation::{NTSTATUS, STATUS_SUCCESS},
+        System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
+    },
+};
+
+use crate::quantity::{nanosecond, Information, Time, Zero};
+
+#[cfg(not(feature = "windows_process_extensions_main_thread_handle"))]
+#[allow(non_upper_case_globals)]
+static NtResumeProcess: Lazy<unsafe extern "system" fn(process_handle: HANDLE) -> NTSTATUS> =
+    Lazy::new(|| {
+        // SAFETY: Getting the module handle for ntdll.dll is safe
+        let ntdll = unsafe { GetModuleHandleW(w!("ntdll.dll")) };
+        assert!(!ntdll.is_null(), "GetModuleHandleW failed");
+
+        // SAFETY: The ntdll handle is valid
+        let nt_resume_process = unsafe { GetProcAddress(ntdll, s!("NtResumeProcess")) };
+
+        // SAFETY: We transmute to the correct function signature
+        unsafe { mem::transmute(nt_resume_process.unwrap()) }
+    });
+
+pub struct CPUTimer {
+    job_object: HANDLE,
 }
 
-struct CPUTimer {
-    handle: RawHandle,
-}
+impl CPUTimer {
+    pub unsafe fn start_suspended_process(child: &process::Child) -> Self {
+        let child_handle = child.as_raw_handle() as HANDLE;
 
-impl TimerStart for CPUTimer {
-    fn start() -> Self {
-        panic!()
-    }
+        // SAFETY: Creating a new job object is safe
+        let job_object = unsafe { CreateJobObjectW(ptr::null_mut(), ptr::null_mut()) };
+        assert!(!job_object.is_null(), "CreateJobObjectW failed");
 
-    fn start_for_process(process: &Child) -> Self {
-        CPUTimer {
-            handle: process.as_raw_handle(),
+        // SAFETY: The job object handle is valid
+        let ret = unsafe { AssignProcessToJobObject(job_object, child_handle) };
+        assert!(ret != 0, "AssignProcessToJobObject failed");
+
+        #[cfg(feature = "windows_process_extensions_main_thread_handle")]
+        {
+            // SAFETY: The main thread handle is valid
+            let ret = unsafe { ResumeThread(child.main_thread_handle().as_raw_handle() as HANDLE) };
+            assert!(ret != u32::MAX, "ResumeThread failed");
         }
+
+        #[cfg(not(feature = "windows_process_extensions_main_thread_handle"))]
+        {
+            // Since we can't get the main thread handle on stable rust, we use
+            // the undocumented but widely known `NtResumeProcess` function to
+            // resume a process by it's handle.
+
+            // SAFETY: The process handle is valid
+            let ret = unsafe { NtResumeProcess(child_handle) };
+            assert!(ret == STATUS_SUCCESS, "NtResumeProcess failed");
+        }
+
+        Self { job_object }
     }
-}
 
-impl TimerStop for CPUTimer {
-    type Result = (Second, Second);
+    pub fn stop(&self, mut child: Child) -> Result<(Time, Time, Option<Information>, ExitStatus)> {
+        let status = child.wait()?;
 
-    fn stop(&self) -> Self::Result {
-        let times = get_cpu_times(self.handle);
-        (
-            times.user_usec as f64 * 1e-6,
-            times.system_usec as f64 * 1e-6,
-        )
-    }
-}
+        let mut job_object_info =
+            mem::MaybeUninit::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>::uninit();
 
-/// Read CPU execution times (dummy for now)
-fn get_cpu_times(handle: RawHandle) -> CPUTimes {
-    let (user_usec, system_usec) = unsafe {
-        let mut _ctime = mem::zeroed();
-        let mut _etime = mem::zeroed();
-        let mut kernel_time = mem::zeroed();
-        let mut user_time = mem::zeroed();
-        let res = GetProcessTimes(
-            handle as HANDLE,
-            &mut _ctime,
-            &mut _etime,
-            &mut kernel_time,
-            &mut user_time,
-        );
+        // SAFETY: A valid job object got created in `start_suspended_process`
+        let res = unsafe {
+            QueryInformationJobObject(
+                self.job_object,
+                JobObjectBasicAccountingInformation,
+                job_object_info.as_mut_ptr().cast(),
+                mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                ptr::null_mut(),
+            )
+        };
 
-        // GetProcessTimes will exit with non-zero if success as per: https://msdn.microsoft.com/en-us/library/windows/desktop/ms683223(v=vs.85).aspx
         if res != 0 {
-            // Extract times as laid out here: https://support.microsoft.com/en-us/help/188768/info-working-with-the-filetime-structure
-            // Both user_time and kernel_time are spans that the proces spent in either.
-            let user: i64 = (((user_time.dwHighDateTime as i64) << 32)
-                + user_time.dwLowDateTime as i64)
-                / HUNDRED_NS_PER_MS;
-            let kernel: i64 = (((kernel_time.dwHighDateTime as i64) << 32)
-                + kernel_time.dwLowDateTime as i64)
-                / HUNDRED_NS_PER_MS;
-            (user, kernel)
-        } else {
-            (0, 0)
-        }
-    };
+            // SAFETY: The job object info got correctly initialized
+            let job_object_info = unsafe { job_object_info.assume_init() };
 
-    CPUTimes {
-        user_usec,
-        system_usec,
+            // The `TotalUserTime` is "The total amount of user-mode execution time for
+            // all active processes associated with the job, as well as all terminated processes no
+            // longer associated with the job, in 100-nanosecond ticks."
+            let user_time = Time::new::<nanosecond>((job_object_info.TotalUserTime as f64) * 100.0);
+
+            // The `TotalKernelTime` is "The total amount of kernel-mode execution time
+            // for all active processes associated with the job, as well as all terminated
+            // processes no longer associated with the job, in 100-nanosecond ticks."
+            let system_time =
+                Time::new::<nanosecond>((job_object_info.TotalKernelTime as f64) * 100.0);
+
+            Ok((user_time, system_time, None, status))
+        } else {
+            Ok((Time::zero(), Time::zero(), None, status))
+        }
+    }
+}
+
+impl Drop for CPUTimer {
+    fn drop(&mut self) {
+        // SAFETY: A valid job object got created in `start_suspended_process`
+        unsafe { CloseHandle(self.job_object) };
     }
 }
